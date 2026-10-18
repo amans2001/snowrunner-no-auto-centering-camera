@@ -4,7 +4,7 @@ A small standalone Windows tool that stops SnowRunner's third-person camera from
 auto-centering behind the truck when it turns. The camera holds the direction you
 set; the right stick / mouse works as normal. **F8** toggles it on and off.
 
-Nexus Mods page: _(link)_
+Nexus Mods page: _(https://www.nexusmods.com/snowrunner/mods/75)_
 
 ## What it does (and doesn't do)
 
