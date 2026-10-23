@@ -5,11 +5,13 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include "hook_blob.h"
+#include "sigscan.h"
 
-#define VERSION      "v2.2"
-#define HOOK_RVA     0x85CAE5
+#define VERSION      "v2.3"
 #define OFF_RETADDR  0
 #define OFF_MAGIC    8
 #define OFF_ENABLED  16
@@ -37,19 +39,55 @@ static DWORD find_pid(void) {
     return pid;
 }
 
-static ULONG_PTR module_base(DWORD pid) {
+static ULONG_PTR module_base(DWORD pid, DWORD *size) {
     ULONG_PTR base = 0;
     for (int tries = 0; tries < 10 && !base; tries++) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if (snap == INVALID_HANDLE_VALUE) { Sleep(500); continue; }
         MODULEENTRY32 me; me.dwSize = sizeof(me);
         if (Module32First(snap, &me)) {
-            do { if (_stricmp(me.szModule, "SnowRunner.exe") == 0) { base = (ULONG_PTR)me.modBaseAddr; break; } }
+            do { if (_stricmp(me.szModule, "SnowRunner.exe") == 0) { base = (ULONG_PTR)me.modBaseAddr; *size = me.modBaseSize; break; } }
             while (Module32Next(snap, &me));
         }
         CloseHandle(snap);
     }
     return base;
+}
+
+// Finds the camera instruction by searching the game's code sections for the byte
+// pattern in sigscan.h, so the tool keeps working when a game update moves the code.
+// Returns its address, 0 if not found, or 1 if the pattern was found more than once.
+static ULONG_PTR find_target(ULONG_PTR base, DWORD imageSize) {
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    if (!ReadProcessMemory(g_proc, (LPCVOID)base, &dos, sizeof(dos), NULL) || dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (!ReadProcessMemory(g_proc, (LPCVOID)(base + dos.e_lfanew), &nt, sizeof(nt), NULL) || nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+    int nsec = nt.FileHeader.NumberOfSections;
+    ULONG_PTR secAddr = base + dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    IMAGE_SECTION_HEADER *secs = malloc(sizeof(IMAGE_SECTION_HEADER) * nsec);
+    if (!secs || !ReadProcessMemory(g_proc, (LPCVOID)secAddr, secs, sizeof(IMAGE_SECTION_HEADER) * nsec, NULL)) { free(secs); return 0; }
+
+    ULONG_PTR found = 0; int total = 0;
+    for (int s = 0; s < nsec; s++) {
+        if (!(secs[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        DWORD rva = secs[s].VirtualAddress, len = secs[s].Misc.VirtualSize;
+        if (!len || rva + len > imageSize) continue;
+        unsigned char *buf = malloc(len);
+        if (!buf) continue;
+        const DWORD CHUNK = 0x100000;                     // read in 1 MB pieces; zero any unreadable piece
+        for (DWORD o = 0; o < len; o += CHUNK) {
+            DWORD n = (len - o < CHUNK) ? len - o : CHUNK;
+            if (!ReadProcessMemory(g_proc, (LPCVOID)(base + rva + o), buf + o, n, NULL)) memset(buf + o, 0, n);
+        }
+        int count = 0;
+        long at = sig_find(buf, len, &count);
+        if (count && !found) found = base + rva + at + SIG_HOOK_AT;
+        total += count;
+        free(buf);
+    }
+    free(secs);
+    if (total > 1) return 1;
+    return found;
 }
 
 static BOOL write_code(ULONG_PTR addr, const void *data, SIZE_T len) {
@@ -90,7 +128,7 @@ static void set_byte(int off, unsigned char v) {
     WriteProcessMemory(g_proc, (LPVOID)(g_blob + off), &v, 1, NULL);
 }
 
-// Returns 1 = ready, 0 = fatal (message shown), -1 = retry later
+// Returns 1 = ready, 0 = fatal (message shown), -1 = retry later, -2 = camera code not found (yet)
 static int install(DWORD pid) {
     g_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
                          PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, pid);
@@ -98,9 +136,16 @@ static int install(DWORD pid) {
         say("Could not open SnowRunner. Try right-click -> Run as administrator.");
         return 0;
     }
-    ULONG_PTR base = module_base(pid);
+    DWORD imageSize = 0;
+    ULONG_PTR base = module_base(pid, &imageSize);
     if (!base) { CloseHandle(g_proc); g_proc = NULL; return -1; }
-    g_target = base + HOOK_RVA;
+    g_target = find_target(base, imageSize);
+    if (g_target == 1) {
+        say("Found more than one possible camera spot in this SnowRunner version.");
+        say("Nothing was changed. The fix needs updating for the new version.");
+        return 0;
+    }
+    if (!g_target) { CloseHandle(g_proc); g_proc = NULL; return -2; }
 
     unsigned char cur[8];
     if (!ReadProcessMemory(g_proc, (LPCVOID)g_target, cur, 8, NULL)) {
@@ -175,7 +220,7 @@ int main(void) {
     if (!RegisterHotKey(NULL, 1, MOD_NOREPEAT, VK_F8))
         say("Note: F8 is in use by another program, so the hotkey may not work.");
 
-    int enabled = 1, waitingShown = 0;
+    int enabled = 1, waitingShown = 0, notFoundTries = 0;
     for (;;) {
         DWORD pid = find_pid();
         if (!pid) {
@@ -186,9 +231,14 @@ int main(void) {
         }
         if (waitingShown) Sleep(3000);       // game just launched: let it finish starting
         int r = install(pid);
+        if (r == -2 && ++notFoundTries >= 10) {            // ~20 s: the game is fully started by now
+            say("This SnowRunner version doesn't match (the game was probably updated).");
+            say("Nothing was changed. The fix needs updating for the new version.");
+            r = 0;
+        }
         if (r == 0) { say(""); say("Press Enter to close."); getchar(); return 1; }
         if (r < 0) { Sleep(2000); continue; }
-        waitingShown = 0;
+        waitingShown = 0; notFoundTries = 0;
 
         set_byte(OFF_ENABLED, (unsigned char)enabled);
         say(enabled ? ">> Camera fix is ON  (F8 to turn off)" : ">> Camera fix is OFF (F8 to turn on)");
